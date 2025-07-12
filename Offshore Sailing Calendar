@@ -1,0 +1,473 @@
+import React, { useState, useEffect, useMemo } from 'react';
+import { initializeApp } from 'firebase/app';
+import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } from 'firebase/auth';
+import { getFirestore, doc, collection, query, orderBy, onSnapshot, addDoc, updateDoc, deleteDoc, serverTimestamp } from 'firebase/firestore';
+
+// Ensure these global variables are defined by the Canvas environment
+const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+const firebaseConfig = typeof __firebase_config !== 'undefined' ? JSON.parse(__firebase_config) : {};
+const initialAuthToken = typeof __initial_auth_token !== 'undefined' ? __initial_auth_token : null;
+
+// Initialize Firebase (only once)
+let app;
+let db;
+let auth;
+
+try {
+    app = initializeApp(firebaseConfig);
+    db = getFirestore(app);
+    auth = getAuth(app);
+} catch (error) {
+    console.error("Firebase initialization failed:", error);
+    // Handle error, e.g., display a message to the user
+}
+
+// Utility to format dates
+const formatDate = (dateString) => {
+    if (!dateString) return 'N/A';
+    const date = new Date(dateString);
+    return date.toLocaleDateString('en-US', { year: 'numeric', month: 'short', day: 'numeric' });
+};
+
+// Utility to add days to a date
+const addDays = (date, days) => {
+    const result = new Date(date);
+    result.setDate(result.getDate() + days);
+    return result;
+};
+
+// Main App Component
+const App = () => {
+    const [legs, setLegs] = useState([]);
+    const [newLegName, setNewLegName] = useState('');
+    const [newLegStartDate, setNewLegStartDate] = useState('');
+    const [newLegDuration, setNewLegDuration] = useState(7); // Default 7 days
+    const [editingLegId, setEditingLegId] = useState(null);
+    const [userId, setUserId] = useState(null);
+    const [isAuthReady, setIsAuthReady] = useState(false);
+    const [message, setMessage] = useState('');
+    const [showAddLegForm, setShowAddLegForm] = useState(false); // State for form visibility
+
+    // Passcode states
+    const [passcode, setPasscode] = useState('');
+    const [isAuthenticated, setIsAuthenticated] = useState(false); // New state for passcode authentication
+    const CORRECT_PASSCODE = 'sailaway'; // Hardcoded passcode for demonstration
+
+    // Calendar state
+    const [currentMonth, setCurrentMonth] = useState(new Date().getMonth());
+    const [currentYear, setCurrentYear] = useState(new Date().getFullYear());
+
+    // Firebase Authentication and Initialization
+    useEffect(() => {
+        if (!app) {
+            setMessage("Firebase is not initialized. Check console for errors.");
+            return;
+        }
+
+        const unsubscribeAuth = onAuthStateChanged(auth, async (user) => {
+            if (user) {
+                setUserId(user.uid);
+                setIsAuthReady(true);
+                setMessage(`Signed in as: ${user.uid}`);
+            } else {
+                try {
+                    if (initialAuthToken) {
+                        await signInWithCustomToken(auth, initialAuthToken);
+                    } else {
+                        await signInAnonymously(auth);
+                    }
+                } catch (error) {
+                    console.error("Firebase authentication failed:", error);
+                    setMessage("Authentication failed. Please try again.");
+                }
+            }
+        });
+
+        return () => unsubscribeAuth();
+    }, []);
+
+    // Firestore Data Listener
+    useEffect(() => {
+        if (!isAuthReady || !userId || !db) {
+            return;
+        }
+
+        // Define the collection path based on user ID and app ID for private data
+        const legsCollectionRef = collection(db, `artifacts/${appId}/users/${userId}/sailing_routes`);
+        const q = query(legsCollectionRef, orderBy('startDate')); // Order by start date
+
+        const unsubscribeFirestore = onSnapshot(q, (snapshot) => {
+            const fetchedLegs = snapshot.docs.map(doc => ({
+                id: doc.id,
+                ...doc.data(),
+                // Ensure dates are parsed correctly as Date objects for calendar logic
+                startDate: doc.data().startDate ? new Date(doc.data().startDate + 'T00:00:00') : null, // Add T00:00:00 for correct UTC interpretation
+                endDate: doc.data().endDate ? new Date(doc.data().endDate + 'T00:00:00') : null,
+            }));
+            setLegs(fetchedLegs);
+            setMessage(''); // Clear any previous messages
+        }, (error) => {
+            console.error("Error fetching legs:", error);
+            setMessage("Error loading sailing legs. Please refresh.");
+        });
+
+        return () => unsubscribeFirestore();
+    }, [isAuthReady, userId, db]); // Re-run when auth state or db changes
+
+    const handlePasscodeSubmit = () => {
+        if (passcode === CORRECT_PASSCODE) {
+            setIsAuthenticated(true);
+            setMessage("Passcode accepted. You can now add/edit legs.");
+        } else {
+            setMessage("Incorrect passcode. Please try again.");
+            setPasscode(''); // Clear passcode on incorrect attempt
+        }
+    };
+
+    const handleAddOrUpdateLeg = async () => {
+        if (!isAuthenticated) {
+            setMessage("Please enter the passcode to add or edit legs.");
+            return;
+        }
+        if (!newLegName || !newLegStartDate || !newLegDuration) {
+            setMessage("Please fill in all leg details.");
+            return;
+        }
+        if (!userId) {
+            setMessage("User not authenticated. Please wait.");
+            return;
+        }
+
+        const start = new Date(newLegStartDate + 'T00:00:00'); // Ensure date is treated consistently
+        const end = addDays(start, parseInt(newLegDuration, 10));
+
+        const legData = {
+            name: newLegName,
+            startDate: start.toISOString().split('T')[0], // Store as YYYY-MM-DD string
+            endDate: end.toISOString().split('T')[0],     // Store as YYYY-MM-DD string
+            durationDays: parseInt(newLegDuration, 10),
+            createdAt: serverTimestamp(), // Add a timestamp for ordering or auditing
+        };
+
+        try {
+            if (editingLegId) {
+                // Update existing leg
+                const legRef = doc(db, `artifacts/${appId}/users/${userId}/sailing_routes`, editingLegId);
+                await updateDoc(legRef, legData);
+                setMessage("Leg updated successfully!");
+                setEditingLegId(null); // Exit editing mode
+            } else {
+                // Add new leg
+                await addDoc(collection(db, `artifacts/${appId}/users/${userId}/sailing_routes`), legData);
+                setMessage("Leg added successfully!");
+            }
+            // Clear form and hide it
+            setNewLegName('');
+            setNewLegStartDate('');
+            setNewLegDuration(7);
+            setShowAddLegForm(false); // Hide the form after successful submission
+        } catch (error) {
+            console.error("Error adding/updating leg:", error);
+            setMessage("Failed to save leg. Please try again.");
+        }
+    };
+
+    const handleEditLeg = (leg) => {
+        if (!isAuthenticated) {
+            setMessage("Please enter the passcode to add or edit legs.");
+            return;
+        }
+        setEditingLegId(leg.id);
+        setNewLegName(leg.name);
+        // Ensure the date format for input type="date" is 'YYYY-MM-DD'
+        setNewLegStartDate(leg.startDate ? leg.startDate.toISOString().split('T')[0] : '');
+        setNewLegDuration(leg.durationDays);
+        setMessage("Editing leg...");
+        setShowAddLegForm(true); // Show the form when editing
+    };
+
+    const handleDeleteLeg = async (id) => {
+        if (!isAuthenticated) {
+            setMessage("Please enter the passcode to delete legs.");
+            return;
+        }
+        if (!userId) {
+            setMessage("User not authenticated. Please wait.");
+            return;
+        }
+        try {
+            await deleteDoc(doc(db, `artifacts/${appId}/users/${userId}/sailing_routes`, id));
+            setMessage("Leg deleted successfully!");
+        } catch (error) {
+            console.error("Error deleting leg:", error);
+            setMessage("Failed to delete leg. Please try again.");
+        }
+    };
+
+    // Calendar logic
+    const daysInMonth = (month, year) => new Date(year, month + 1, 0).getDate();
+    const firstDayOfMonth = (month, year) => new Date(year, month, 1).getDay(); // 0 for Sunday, 1 for Monday
+
+    const getCalendarDays = useMemo(() => {
+        const totalDays = daysInMonth(currentMonth, currentYear);
+        const startDay = firstDayOfMonth(currentMonth, currentYear); // 0 (Sunday) to 6 (Saturday)
+        const days = [];
+
+        // Add empty cells for days before the 1st of the month
+        for (let i = 0; i < startDay; i++) {
+            days.push(null);
+        }
+
+        // Add actual days of the month
+        for (let i = 1; i <= totalDays; i++) {
+            days.push(i);
+        }
+        return days;
+    }, [currentMonth, currentYear]);
+
+    const handlePrevMonth = () => {
+        setCurrentMonth(prev => (prev === 0 ? 11 : prev - 1));
+        if (currentMonth === 0) setCurrentYear(prev => prev - 1);
+    };
+
+    const handleNextMonth = () => {
+        setCurrentMonth(prev => (prev === 11 ? 0 : prev + 1));
+        if (currentMonth === 11) setCurrentYear(prev => prev + 1);
+    };
+
+    const monthNames = ["January", "February", "March", "April", "May", "June",
+        "July", "August", "September", "October", "November", "December"];
+    const dayNames = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+
+    const isDateInLeg = (date) => {
+        const checkDate = new Date(currentYear, currentMonth, date);
+        // Normalize checkDate to midnight for accurate comparison
+        checkDate.setHours(0, 0, 0, 0);
+
+        for (const leg of legs) {
+            if (leg.startDate && leg.endDate) {
+                const legStart = new Date(leg.startDate);
+                const legEnd = new Date(leg.endDate);
+                legStart.setHours(0, 0, 0, 0);
+                legEnd.setHours(0, 0, 0, 0);
+
+                if (checkDate >= legStart && checkDate <= legEnd) {
+                    return leg; // Return the leg object if the date falls within it
+                }
+            }
+        }
+        return null;
+    };
+
+
+    return (
+        <div className="min-h-screen bg-gradient-to-br from-blue-100 to-indigo-200 p-4 font-inter text-gray-800 flex items-center justify-center">
+            <div className="bg-white p-8 rounded-xl shadow-2xl w-full max-w-4xl border border-blue-200">
+                <h1 className="text-4xl font-extrabold text-center text-blue-700 mb-6 drop-shadow-sm">
+                    Sailing Route Planner
+                </h1>
+                {userId && (
+                    <p className="text-center text-sm text-gray-600 mb-4">
+                        Your User ID: <span className="font-mono bg-gray-100 px-2 py-1 rounded-md text-gray-700 text-xs">{userId}</span>
+                    </p>
+                )}
+                {message && (
+                    <div className="bg-blue-100 border border-blue-400 text-blue-700 px-4 py-3 rounded-md relative mb-4 text-center" role="alert">
+                        {message}
+                    </div>
+                )}
+
+                {/* Passcode Input */}
+                {!isAuthenticated && (
+                    <div className="mb-8 p-6 bg-yellow-50 rounded-lg border border-yellow-200 shadow-inner text-center">
+                        <h2 className="text-2xl font-bold text-yellow-800 mb-4">Enter Passcode to Edit Route</h2>
+                        <input
+                            type="password"
+                            value={passcode}
+                            onChange={(e) => setPasscode(e.target.value)}
+                            placeholder="Enter passcode"
+                            className="w-full max-w-xs px-4 py-2 border border-gray-300 rounded-lg focus:ring-yellow-500 focus:border-yellow-500 transition duration-200 mb-4"
+                        />
+                        <button
+                            onClick={handlePasscodeSubmit}
+                            className="w-full max-w-xs bg-yellow-600 hover:bg-yellow-700 text-white font-bold py-3 px-6 rounded-lg shadow-md hover:shadow-lg transition duration-300 ease-in-out transform hover:scale-105"
+                        >
+                            Submit Passcode
+                        </button>
+                    </div>
+                )}
+
+                {/* Toggle Button for Input Form (only shown if authenticated) */}
+                {isAuthenticated && !showAddLegForm && (
+                    <div className="mb-8 text-center">
+                        <button
+                            onClick={() => setShowAddLegForm(true)}
+                            className="bg-blue-600 hover:bg-blue-700 text-white font-bold py-3 px-8 rounded-lg shadow-md hover:shadow-lg transition duration-300 ease-in-out transform hover:scale-105"
+                        >
+                            Add New Leg
+                        </button>
+                    </div>
+                )}
+
+                {/* Input Form (conditionally rendered if authenticated and showAddLegForm is true) */}
+                {isAuthenticated && showAddLegForm && (
+                    <div className="mb-8 p-6 bg-blue-50 rounded-lg border border-blue-200 shadow-inner">
+                        <h2 className="text-2xl font-bold text-blue-600 mb-4">
+                            {editingLegId ? 'Edit Sailing Leg' : 'Add New Sailing Leg'}
+                        </h2>
+                        <div className="grid grid-cols-1 md:grid-cols-3 gap-4 mb-4">
+                            <div>
+                                <label htmlFor="legName" className="block text-sm font-medium text-gray-700 mb-1">Leg Name</label>
+                                <input
+                                    type="text"
+                                    id="legName"
+                                    value={newLegName}
+                                    onChange={(e) => setNewLegName(e.target.value)}
+                                    placeholder="e.g., Phuket to Christmas Island"
+                                    className="w-full px-4 py-2 border border-gray-300 rounded-lg focus:ring-blue-500 focus:border-blue-500 transition duration-200"
+                                />
+                            </div>
+                            <div>
+                                <label htmlFor="startDate" className="block text-sm font-medium text-gray-700 mb-1">Start Date</label>
+                                <input
+                                    type="date"
+                                    id="startDate"
+                                    value={newLegStartDate}
+                                    onChange={(e) => setNewLegStartDate(e.target.value)}
+                                    className="w-full px-4 py-2 border border-gray-300 rounded-lg focus:ring-blue-500 focus:border-blue-500 transition duration-200"
+                                />
+                            </div>
+                            <div>
+                                <label htmlFor="duration" className="block text-sm font-medium text-gray-700 mb-1">Duration (Days)</label>
+                                <input
+                                    type="number"
+                                    id="duration"
+                                    value={newLegDuration}
+                                    onChange={(e) => setNewLegDuration(parseInt(e.target.value) || 0)}
+                                    min="1"
+                                    className="w-full px-4 py-2 border border-gray-300 rounded-lg focus:ring-blue-500 focus:border-blue-500 transition duration-200"
+                                />
+                            </div>
+                        </div>
+                        <button
+                            onClick={handleAddOrUpdateLeg}
+                            className="w-full bg-blue-600 hover:bg-blue-700 text-white font-bold py-3 px-6 rounded-lg shadow-md hover:shadow-lg transition duration-300 ease-in-out transform hover:scale-105"
+                        >
+                            {editingLegId ? 'Update Leg' : 'Add Leg'}
+                        </button>
+                        {editingLegId && (
+                            <button
+                                onClick={() => {
+                                    setEditingLegId(null);
+                                    setNewLegName('');
+                                    setNewLegStartDate('');
+                                    setNewLegDuration(7);
+                                    setMessage('');
+                                    setShowAddLegForm(false); // Hide form on cancel edit
+                                }}
+                                className="w-full mt-2 bg-gray-300 hover:bg-gray-400 text-gray-800 font-bold py-3 px-6 rounded-lg shadow-md hover:shadow-lg transition duration-300 ease-in-out transform hover:scale-105"
+                            >
+                                Cancel Edit
+                            </button>
+                        )}
+                    </div>
+                )}
+
+
+                {/* Calendar View */}
+                <div className="mb-8 p-6 bg-green-50 rounded-lg border border-green-200 shadow-inner">
+                    <h2 className="text-2xl font-bold text-green-700 mb-4 text-center">Calendar View</h2>
+                    <div className="flex justify-between items-center mb-4">
+                        <button
+                            onClick={handlePrevMonth}
+                            className="bg-green-600 hover:bg-green-700 text-white font-bold py-2 px-4 rounded-lg shadow-md transition duration-200"
+                        >
+                            &lt; Prev
+                        </button>
+                        <h3 className="text-xl font-semibold text-green-800">
+                            {monthNames[currentMonth]} {currentYear}
+                        </h3>
+                        <button
+                            onClick={handleNextMonth}
+                            className="bg-green-600 hover:bg-green-700 text-white font-bold py-2 px-4 rounded-lg shadow-md transition duration-200"
+                        >
+                            Next &gt;
+                        </button>
+                    </div>
+                    <div className="grid grid-cols-7 gap-1 text-center">
+                        {dayNames.map(day => (
+                            <div key={day} className="font-bold text-gray-700 py-2 bg-green-100 rounded-md">
+                                {day}
+                            </div>
+                        ))}
+                        {getCalendarDays.map((day, index) => {
+                            const legForDay = day ? isDateInLeg(day) : null;
+                            const isToday = day && new Date().getDate() === day && new Date().getMonth() === currentMonth && new Date().getFullYear() === currentYear;
+
+                            let cellClasses = "p-2 rounded-md transition duration-100 ease-in-out";
+                            if (day === null) {
+                                cellClasses += " bg-gray-100";
+                            } else if (legForDay) {
+                                cellClasses += " bg-blue-400 text-white font-bold cursor-pointer relative group";
+                            } else if (isToday) {
+                                cellClasses += " bg-yellow-300 text-gray-900 font-bold border-2 border-yellow-500";
+                            } else {
+                                cellClasses += " bg-white hover:bg-gray-100";
+                            }
+
+                            return (
+                                <div key={index} className={cellClasses}>
+                                    {day}
+                                    {legForDay && (
+                                        <div className="absolute top-0 left-0 w-full h-full flex items-center justify-center text-xs text-center p-1 opacity-0 group-hover:opacity-100 bg-blue-600 rounded-md transition-opacity duration-200 pointer-events-none">
+                                            {legForDay.name}
+                                        </div>
+                                    )}
+                                </div>
+                            );
+                        })}
+                    </div>
+                </div>
+
+                {/* Sailing Legs Timeline */}
+                <div className="p-6 bg-gray-50 rounded-lg border border-gray-200 shadow-inner">
+                    <h2 className="text-2xl font-bold text-gray-700 mb-4">Your Sailing Timeline</h2>
+                    {legs.length === 0 ? (
+                        <p className="text-center text-gray-500 italic">No legs added yet. Start planning your adventure!</p>
+                    ) : (
+                        <div className="space-y-4">
+                            {legs.map((leg) => (
+                                <div key={leg.id} className="bg-white p-4 rounded-lg shadow-sm border border-gray-100 flex flex-col md:flex-row justify-between items-start md:items-center">
+                                    <div className="flex-grow mb-2 md:mb-0">
+                                        <h3 className="text-lg font-semibold text-blue-800">{leg.name}</h3>
+                                        <p className="text-sm text-gray-600">
+                                            <span className="font-medium">Start:</span> {formatDate(leg.startDate)} &bull;
+                                            <span className="font-medium ml-2">End:</span> {formatDate(leg.endDate)} &bull;
+                                            <span className="font-medium ml-2">Duration:</span> {leg.durationDays} days
+                                        </p>
+                                    </div>
+                                    <div className="flex space-x-2">
+                                        <button
+                                            onClick={() => handleEditLeg(leg)}
+                                            className="bg-yellow-500 hover:bg-yellow-600 text-white px-4 py-2 rounded-lg text-sm shadow-md transition duration-200"
+                                        >
+                                            Edit
+                                        </button>
+                                        <button
+                                            onClick={() => handleDeleteLeg(leg.id)}
+                                            className="bg-red-500 hover:bg-red-600 text-white px-4 py-2 rounded-lg text-sm shadow-md transition duration-200"
+                                        >
+                                            Delete
+                                        </button>
+                                    </div>
+                                </div>
+                            ))}
+                        </div>
+                    )}
+                </div>
+            </div>
+        </div>
+    );
+};
+
+export default App;
